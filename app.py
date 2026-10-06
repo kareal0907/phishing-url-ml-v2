@@ -1,6 +1,7 @@
 
 import io, os, re, json, time, html, base64, threading, csv, zipfile, tempfile, math, ipaddress
-from datetime import datetime
+import socket, ssl, struct
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 import numpy as np
 import pandas as pd
@@ -9,6 +10,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from flask import Flask, request, redirect
+import whois
+import dns.resolver
 from werkzeug.utils import secure_filename
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
 from sklearn.preprocessing import StandardScaler
@@ -437,6 +440,217 @@ def extract_basic_features(url):
         "url_entropy": _entropy(norm),
     }
 
+SUSPICIOUS_TLDS = {
+    ".tk", ".ml", ".ga", ".cf", ".gq", ".xyz", ".top", ".pw", ".cc", ".club",
+    ".work", ".date", ".racing", ".win", ".bid", ".stream", ".download",
+    ".loan", ".trade", ".party", ".science", ".click", ".link", ".gdn",
+    ".men", ".review", ".country", ".cricket", ".accountant", ".faith",
+}
+
+PHISHING_BLACKLIST_DNS = [
+    "zen.spamhaus.org",
+    "b.barracudacentral.org",
+    "bl.spamcop.net",
+]
+
+def _safe_whois(hostname):
+    try:
+        w = whois.whois(hostname)
+        return w
+    except Exception:
+        return None
+
+def _safe_dns(hostname, rdtype="A"):
+    try:
+        answers = dns.resolver.resolve(hostname, rdtype, lifetime=5)
+        return [str(r) for r in answers]
+    except Exception:
+        return []
+
+def _check_ssl(hostname, port=443):
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((hostname, port), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+                not_after = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                issuer = dict(x[0] for x in cert.get("issuer", []))
+                return {
+                    "valid": True,
+                    "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
+                    "expires": not_after.strftime("%Y-%m-%d"),
+                    "days_left": (not_after - datetime.utcnow()).days,
+                }
+    except Exception:
+        return {"valid": False, "issuer": "", "expires": "", "days_left": -1}
+
+def _check_dnsbl(ip):
+    results = {}
+    reversed_ip = ".".join(reversed(ip.split(".")))
+    for bl in PHISHING_BLACKLIST_DNS:
+        try:
+            dns.resolver.resolve(f"{reversed_ip}.{bl}", "A", lifetime=3)
+            results[bl] = True
+        except Exception:
+            results[bl] = False
+    return results
+
+def _ip_to_int(ip):
+    return struct.unpack("!I", socket.inet_aton(ip))[0]
+
+def extract_host_features(url):
+    raw = str(url or "").strip()
+    parse_target = raw if re.match(r"^[a-z][a-z0-9+.-]*://", raw, re.I) else "http://" + raw
+    try:
+        p = urlsplit(parse_target)
+        hostname = (p.hostname or "").lower()
+        scheme = (p.scheme or "").lower()
+    except Exception:
+        hostname = ""
+        scheme = ""
+
+    result = {
+        "hostname": hostname,
+        "whois": {},
+        "dns": {},
+        "ssl": {},
+        "blacklist": {},
+        "risk_factors": [],
+        "safe_factors": [],
+        "risk_score": 0,
+    }
+    if not hostname:
+        result["risk_factors"].append("Khong xac dinh duoc hostname")
+        result["risk_score"] = 100
+        return result
+
+    risk_score = 0
+
+    # --- WHOIS ---
+    w = _safe_whois(hostname)
+    if w:
+        creation = w.creation_date
+        if isinstance(creation, list):
+            creation = creation[0]
+        expiration = w.expiration_date
+        if isinstance(expiration, list):
+            expiration = expiration[0]
+
+        domain_age_days = -1
+        if creation:
+            if creation.tzinfo:
+                creation = creation.replace(tzinfo=None)
+            domain_age_days = (datetime.utcnow() - creation).days
+
+        days_to_expire = -1
+        if expiration:
+            if expiration.tzinfo:
+                expiration = expiration.replace(tzinfo=None)
+            days_to_expire = (expiration - datetime.utcnow()).days
+
+        registrar = w.registrar or "Khong ro"
+        name_servers = w.name_servers or []
+        if isinstance(name_servers, str):
+            name_servers = [name_servers]
+
+        result["whois"] = {
+            "registrar": str(registrar),
+            "creation_date": str(creation or "Khong ro"),
+            "expiration_date": str(expiration or "Khong ro"),
+            "domain_age_days": domain_age_days,
+            "days_to_expire": days_to_expire,
+            "name_servers": [str(ns).lower() for ns in name_servers[:5]],
+            "dnssec": str(getattr(w, "dnssec", "Khong ro")),
+            "org": str(w.org or "Khong ro"),
+            "country": str(getattr(w, "country", "") or "Khong ro"),
+        }
+
+        if domain_age_days >= 0 and domain_age_days < 30:
+            risk_score += 30
+            result["risk_factors"].append(f"Ten mien moi tao ({domain_age_days} ngay) — rat dang ngo")
+        elif domain_age_days >= 0 and domain_age_days < 180:
+            risk_score += 15
+            result["risk_factors"].append(f"Ten mien tuong doi moi ({domain_age_days} ngay)")
+        elif domain_age_days >= 365:
+            result["safe_factors"].append(f"Ten mien da ton tai {domain_age_days} ngay")
+
+        if days_to_expire >= 0 and days_to_expire < 30:
+            risk_score += 10
+            result["risk_factors"].append(f"Ten mien sap het han ({days_to_expire} ngay)")
+
+    else:
+        risk_score += 10
+        result["risk_factors"].append("Khong tra cuu duoc WHOIS (co the bi an hoac domain khong ton tai)")
+        result["whois"] = {"error": "Khong tra cuu duoc"}
+
+    # --- DNS ---
+    a_records = _safe_dns(hostname, "A")
+    mx_records = _safe_dns(hostname, "MX")
+    ns_records = _safe_dns(hostname, "NS")
+    txt_records = _safe_dns(hostname, "TXT")
+
+    result["dns"] = {
+        "a_records": a_records[:5],
+        "mx_records": mx_records[:5],
+        "ns_records": ns_records[:5],
+        "txt_records": txt_records[:3],
+        "has_a": len(a_records) > 0,
+        "has_mx": len(mx_records) > 0,
+        "has_ns": len(ns_records) > 0,
+    }
+
+    if not a_records:
+        risk_score += 20
+        result["risk_factors"].append("Khong co ban ghi DNS A — domain khong phan giai duoc")
+    if not mx_records:
+        risk_score += 5
+        result["risk_factors"].append("Khong co ban ghi MX (khong co mail server)")
+
+    # --- SSL ---
+    if scheme == "https" or not scheme:
+        ssl_info = _check_ssl(hostname)
+        result["ssl"] = ssl_info
+        if ssl_info["valid"]:
+            result["safe_factors"].append(f"Chung chi SSL hop le, cap boi {ssl_info['issuer']}")
+            if ssl_info["days_left"] < 15:
+                risk_score += 5
+                result["risk_factors"].append(f"Chung chi SSL sap het han ({ssl_info['days_left']} ngay)")
+        else:
+            risk_score += 15
+            result["risk_factors"].append("Khong co chung chi SSL hop le")
+    else:
+        risk_score += 10
+        result["risk_factors"].append("Khong dung HTTPS")
+        result["ssl"] = {"valid": False, "note": "URL dung HTTP, khong kiem tra SSL"}
+
+    # --- TLD ---
+    parts = hostname.rsplit(".", 1)
+    if len(parts) == 2:
+        tld = "." + parts[1]
+        if tld in SUSPICIOUS_TLDS:
+            risk_score += 15
+            result["risk_factors"].append(f"TLD dang ngo: {tld} (thuong dung cho phishing)")
+
+    # --- Blacklist (DNSBL) ---
+    if a_records:
+        ip = a_records[0]
+        try:
+            ipaddress.ip_address(ip)
+            bl = _check_dnsbl(ip)
+            result["blacklist"] = bl
+            listed = [name for name, v in bl.items() if v]
+            if listed:
+                risk_score += 25
+                result["risk_factors"].append(f"IP {ip} nam trong blacklist: {', '.join(listed)}")
+            else:
+                result["safe_factors"].append(f"IP {ip} khong nam trong blacklist nao")
+        except ValueError:
+            result["blacklist"] = {"note": "Khong phai IPv4, bo qua DNSBL"}
+
+    result["risk_score"] = min(risk_score, 100)
+    return result
+
+
 def fig_b64(fig):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=110)
@@ -465,6 +679,17 @@ input[type=file],input[type=text],input[type=number],select{padding:8px;border-r
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:700px){.grid{grid-template-columns:1fr}}
 tr.best{background:#14532d}tr.best td{color:#86efac;font-weight:bold}
 .bar{background:#334155;border-radius:8px;height:22px;overflow:hidden}.bar div{background:#2563eb;height:100%}
+.risk-meter{width:100%;height:30px;background:#334155;border-radius:8px;overflow:hidden;margin:10px 0}
+.risk-meter div{height:100%;border-radius:8px;transition:width 0.5s}
+.risk-low{background:linear-gradient(90deg,#22c55e,#4ade80)}
+.risk-mid{background:linear-gradient(90deg,#eab308,#f59e0b)}
+.risk-high{background:linear-gradient(90deg,#ef4444,#dc2626)}
+.tag{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;margin:2px}
+.tag-risk{background:#7f1d1d;color:#fca5a5}.tag-safe{background:#14532d;color:#86efac}
+.section{background:#1e293b;border-radius:10px;padding:18px;margin-bottom:16px}
+.section h3{color:#93c5fd;margin-top:0;border-bottom:1px solid #334155;padding-bottom:6px}
+.kv{display:grid;grid-template-columns:200px 1fr;gap:4px 12px;font-size:14px}
+.kv .k{color:#94a3b8}.kv .v{color:#e2e8f0;word-break:break-all}
 </style>"""
 
 def page(body, refresh=False):
@@ -525,6 +750,7 @@ def home():
             links += "<a href='/run/result'>Xem ket qua thuc nghiem gan nhat &rarr;</a><br>"
         if ucol and get_bundle(ds):
             links += "<a href='/check_url'>Kiem tra URL &rarr;</a><br>"
+        links += "<a href='/analyze_url'>Phan tich URL sau (DNS/WHOIS/SSL/Blacklist) &rarr;</a><br>"
         results = (f"<div class='card'><h2>2. Ket qua</h2>{links or '<p>Chua co ket qua.</p>'}"
                    "<form method='post' action='/run'><button type='submit'>Chay lai thuc nghiem</button></form></div>")
 
@@ -535,6 +761,7 @@ def home():
       <input type="file" name="file" accept=".csv,.tsv,.txt,.data,.log,.json,.jsonl,.xlsx,.xls,.arff,.parquet" required><button type="submit">Tai len</button>
     </form></div>
     {results}
+    <div class="card"><a href="/analyze_url">Phan tich URL sau (DNS/WHOIS/SSL/Blacklist) &rarr;</a></div>
     <div class="card"><a href="/history">Xem lich su thuc nghiem ({len(HISTORY)} ket qua) &rarr;</a></div>"""
     return page(body)
 
@@ -946,6 +1173,142 @@ def check_url():
     <div class="card"><form method="post"><input type="text" name="url" style="width:85%" required
     placeholder="Dan URL can kiem tra"> <button>Kiem tra</button></form>{result}
     <p><a href="/">&larr; Trang chu</a></p></div>""")
+
+
+@app.route("/analyze_url", methods=["GET", "POST"])
+def analyze_url():
+    result = ""
+    if request.method == "POST":
+        url = request.form.get("url", "").strip()
+        if not url:
+            return err_page("Hay nhap URL can phan tich.")
+
+        lexical = extract_basic_features(url)
+        host = extract_host_features(url)
+
+        # Risk meter
+        rs = host["risk_score"]
+        if rs <= 25:
+            level, color_cls, label = "Thap", "risk-low", "AN TOAN"
+        elif rs <= 55:
+            level, color_cls, label = "Trung binh", "risk-mid", "CAN THAN"
+        else:
+            level, color_cls, label = "Cao", "risk-high", "NGUY HIEM"
+
+        risk_tags = "".join(f"<span class='tag tag-risk'>{esc(f)}</span> " for f in host["risk_factors"])
+        safe_tags = "".join(f"<span class='tag tag-safe'>{esc(f)}</span> " for f in host["safe_factors"])
+
+        # WHOIS section
+        wh = host["whois"]
+        if "error" in wh:
+            whois_html = f"<p class='bad'>{esc(wh['error'])}</p>"
+        else:
+            whois_html = f"""<div class='kv'>
+            <div class='k'>Nha dang ky (Registrar)</div><div class='v'>{esc(wh.get('registrar',''))}</div>
+            <div class='k'>To chuc</div><div class='v'>{esc(wh.get('org',''))}</div>
+            <div class='k'>Quoc gia</div><div class='v'>{esc(wh.get('country',''))}</div>
+            <div class='k'>Ngay tao</div><div class='v'>{esc(wh.get('creation_date',''))}</div>
+            <div class='k'>Ngay het han</div><div class='v'>{esc(wh.get('expiration_date',''))}</div>
+            <div class='k'>Tuoi domain</div><div class='v'>{wh.get('domain_age_days','')} ngay</div>
+            <div class='k'>Con lai truoc het han</div><div class='v'>{wh.get('days_to_expire','')} ngay</div>
+            <div class='k'>DNSSEC</div><div class='v'>{esc(wh.get('dnssec',''))}</div>
+            <div class='k'>Name Servers</div><div class='v'>{esc(', '.join(wh.get('name_servers',[])))}</div>
+            </div>"""
+
+        # DNS section
+        dn = host["dns"]
+        dns_html = f"""<div class='kv'>
+        <div class='k'>Ban ghi A</div><div class='v'>{esc(', '.join(dn.get('a_records',[]))) or 'Khong co'}</div>
+        <div class='k'>Ban ghi MX</div><div class='v'>{esc(', '.join(dn.get('mx_records',[]))) or 'Khong co'}</div>
+        <div class='k'>Ban ghi NS</div><div class='v'>{esc(', '.join(dn.get('ns_records',[]))) or 'Khong co'}</div>
+        <div class='k'>Ban ghi TXT</div><div class='v'>{esc(', '.join(dn.get('txt_records',[]))) or 'Khong co'}</div>
+        </div>"""
+
+        # SSL section
+        sl = host["ssl"]
+        if sl.get("valid"):
+            ssl_html = f"""<div class='kv'>
+            <div class='k'>Trang thai</div><div class='v'><span class='ok'>Hop le</span></div>
+            <div class='k'>Nha cap (Issuer)</div><div class='v'>{esc(sl.get('issuer',''))}</div>
+            <div class='k'>Het han</div><div class='v'>{esc(sl.get('expires',''))}</div>
+            <div class='k'>Con lai</div><div class='v'>{sl.get('days_left','')} ngay</div>
+            </div>"""
+        else:
+            note = sl.get("note", "Khong co chung chi SSL hop le")
+            ssl_html = f"<p class='bad'>{esc(note)}</p>"
+
+        # Blacklist section
+        bl = host["blacklist"]
+        if isinstance(bl, dict) and "note" not in bl:
+            bl_rows = "".join(
+                f"<tr><td>{esc(name)}</td><td class='{'bad' if v else 'ok'}'>{'CO trong blacklist' if v else 'Khong'}</td></tr>"
+                for name, v in bl.items()
+            )
+            bl_html = f"<table><tr><th>Blacklist</th><th>Ket qua</th></tr>{bl_rows}</table>"
+        else:
+            bl_html = f"<p class='hint'>{esc(bl.get('note','Khong kiem tra duoc'))}</p>"
+
+        # Lexical features table
+        lex_rows = "".join(f"<tr><td>{esc(k)}</td><td>{v}</td></tr>" for k, v in lexical.items())
+        lex_html = f"<table><tr><th>Dac trung</th><th>Gia tri</th></tr>{lex_rows}</table>"
+
+        # ML prediction (if models available)
+        ml_html = ""
+        ds = CURRENT["name"]
+        b = get_bundle(ds) if ds else None
+        if b:
+            feat = pd.DataFrame([lexical])
+            ml_rows, ph = "", 0
+            for name, (kind, m) in b["models"].items():
+                X = feat if kind == "feat" else pd.Series([normalize_url(url)])
+                pred = int(m.predict(X)[0])
+                ph += pred
+                pr = f" ({m.predict_proba(X)[0][pred]*100:.1f}%)" if hasattr(m, "predict_proba") else ""
+                color = "#f87171" if pred else "#4ade80"
+                ml_rows += (f"<tr><td>{esc(name)}</td>"
+                            f"<td style='color:{color};font-weight:bold'>{'PHISHING' if pred else 'Hop le'}{pr}</td></tr>")
+            n = len(b["models"])
+            bad_ml = ph > n / 2
+            ml_html = f"""<div class='section'><h3>Du doan Machine Learning</h3>
+            <p style='font-size:20px;font-weight:bold;color:{"#f87171" if bad_ml else "#4ade80"}'>
+            {'NGHI NGO PHISHING' if bad_ml else 'CO VE AN TOAN'} ({ph}/{n} mo hinh cho la phishing)</p>
+            <table><tr><th>Mo hinh</th><th>Du doan</th></tr>{ml_rows}</table></div>"""
+
+        result = f"""
+        <div class='box'>
+            <div class='big' style='color:{"#f87171" if rs > 55 else "#eab308" if rs > 25 else "#4ade80"}'>{label}</div>
+            <div>Diem rui ro: {rs}/100 ({level})</div>
+            <div class='risk-meter'><div class='{color_cls}' style='width:{max(rs,3)}%'></div></div>
+            <div class='hint'>URL: {esc(url)}</div>
+        </div>
+
+        {ml_html}
+
+        <div class='section'><h3>Yeu to rui ro</h3>{risk_tags or "<span class='tag tag-safe'>Khong phat hien yeu to rui ro</span>"}</div>
+        <div class='section'><h3>Yeu to an toan</h3>{safe_tags or "<span class='hint'>Khong co du lieu</span>"}</div>
+
+        <div class='grid'>
+            <div class='section'><h3>WHOIS - Thong tin ten mien</h3>{whois_html}</div>
+            <div class='section'><h3>DNS - Ban ghi</h3>{dns_html}</div>
+            <div class='section'><h3>SSL/TLS - Chung chi</h3>{ssl_html}</div>
+            <div class='section'><h3>Blacklist (DNSBL)</h3>{bl_html}</div>
+        </div>
+
+        <div class='section'><h3>Dac trung Lexical (trich tu chuoi URL)</h3>{lex_html}</div>
+        """
+
+    body = f"""<h1>Phan tich URL sau (Host-based)</h1>
+    <p class='hint'>Tra cuu DNS, WHOIS, SSL, Blacklist + dac trung Lexical + du doan ML. Can ket noi Internet.</p>
+    <div class='card'>
+        <form method='post'>
+            <input type='text' name='url' style='width:80%' required placeholder='Nhap URL can phan tich (vd: https://example.com)'>
+            <button type='submit'>Phan tich</button>
+        </form>
+    </div>
+    {result}
+    <p><a href='/'>&larr; Trang chu</a>
+    {" | <a href='/check_url'>Kiem tra URL nhanh</a>" if CURRENT.get("name") and get_bundle(CURRENT["name"]) else ""}</p>"""
+    return page(body)
 
 
 try:

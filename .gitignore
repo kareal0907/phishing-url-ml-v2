@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.env
+
+# Large dataset files
+upload/phreshphish_100k.csv
+upload/phreshphish_10k.csv
+
+# Saved models (generated at runtime)
+saved_models/
+saved_datasets/
+
+# Logs
+server.log
+history.csv
+
+# IDE / Claude
+.claude/
